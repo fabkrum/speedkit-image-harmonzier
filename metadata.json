@@ -1,0 +1,5 @@
+{
+  "name": "Corporate Headshot Harmonizer",
+  "description": "Bulk upload employee photos, apply a consistent background and lighting style from a reference image using AI, and download all processed images as a ZIP file.",
+  "requestFramePermissions": []
+}
