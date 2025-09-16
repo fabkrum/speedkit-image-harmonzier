@@ -1,20 +1,40 @@
 import React, { useState, useCallback, useMemo, useEffect } from 'react';
-import { EmployeeImage } from './types';
+import { EmployeeImage, Base64Image } from './types';
 import { convertImageToBase64 } from './utils/fileUtils';
-import { processImageStyle } from './services/geminiService';
+import { generateMasterBackground, processHeadshot } from './services/geminiService';
 import ImageUploader from './components/ImageUploader';
 import ImageCard from './components/ImageCard';
 import Spinner from './components/Spinner';
-import { UploadIcon, DownloadIcon, TrashIcon } from './components/icons';
+import { UploadIcon, DownloadIcon, TrashIcon, ImageIcon, CheckCircleIcon } from './components/icons';
 
 // Declare global variables from CDN scripts
 declare var JSZip: any;
 declare var saveAs: any;
 
+type AppState = 'needs_logo' | 'needs_photos' | 'processing_photos' | 'idle';
+
 const App: React.FC = () => {
+  const [appState, setAppState] = useState<AppState>('needs_logo');
+  const [masterBackground, setMasterBackground] = useState<Base64Image | null>(null);
+  const [companyLogo, setCompanyLogo] = useState<Base64Image | null>(null);
   const [employeeImages, setEmployeeImages] = useState<EmployeeImage[]>([]);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [isZipping, setIsZipping] = useState(false);
+
+  const handleLogoUpload = async (files: FileList) => {
+    if (files.length === 0) return;
+    try {
+      const logoBase64 = await convertImageToBase64(files[0], { cropToSquare: false });
+      setCompanyLogo(logoBase64);
+      setAppState('needs_photos');
+    } catch (error) {
+      console.error("Error converting logo:", error);
+      // You might want to show an error to the user here
+    }
+  };
+  
+  const companyLogoUrl = useMemo(() => {
+    if (!companyLogo) return null;
+    return `data:${companyLogo.mimeType};base64,${companyLogo.base64}`;
+  }, [companyLogo]);
 
   const handleEmployeesUpload = async (files: FileList) => {
     const newImages = Array.from(files).map((file) => ({
@@ -27,14 +47,14 @@ const App: React.FC = () => {
     setEmployeeImages((prev) => [...prev, ...newImages]);
   };
 
-
   const processPendingImages = useCallback(async () => {
+    if (!companyLogo) return;
+
     const imagesToProcess = employeeImages.filter(img => img.status === 'pending');
     if (imagesToProcess.length === 0) return;
 
-    setIsProcessing(true);
+    setAppState('processing_photos');
 
-    // Set status to 'processing' for the images that are about to be processed.
     setEmployeeImages(prev =>
       prev.map(img =>
         imagesToProcess.some(p => p.id === img.id)
@@ -43,11 +63,36 @@ const App: React.FC = () => {
       )
     );
 
+    let currentMasterBackground = masterBackground;
+
     try {
+      // Step 1: Generate background if it doesn't exist
+      if (!currentMasterBackground) {
+        try {
+          const bgDataUrl = await generateMasterBackground();
+          const base64 = bgDataUrl.split(',')[1];
+          currentMasterBackground = { base64, mimeType: 'image/png' };
+          setMasterBackground(currentMasterBackground);
+        } catch (error) {
+          // If background generation fails, fail all pending images
+          const errorMessage = error instanceof Error ? error.message : 'Master background generation failed.';
+          setEmployeeImages(prev =>
+            prev.map(img =>
+              imagesToProcess.some(p => p.id === img.id)
+                ? { ...img, status: 'error', error: errorMessage }
+                : img
+            )
+          );
+          setAppState('idle');
+          return; // Exit
+        }
+      }
+      
+      // Step 2: Process all pending images with the guaranteed background
       const processingPromises = imagesToProcess.map(async (image) => {
         try {
-          const employeeImageBase64 = await convertImageToBase64(image.file);
-          const processedImageUrl = await processImageStyle(employeeImageBase64);
+          const employeeImageBase64 = await convertImageToBase64(image.file, { cropToSquare: true });
+          const processedImageUrl = await processHeadshot(employeeImageBase64, currentMasterBackground!, companyLogo);
           return { id: image.id, status: 'done' as const, url: processedImageUrl };
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : 'Unknown processing error.';
@@ -57,7 +102,6 @@ const App: React.FC = () => {
 
       const results = await Promise.allSettled(processingPromises);
 
-      // Update the state with the results of the image processing.
       setEmployeeImages(prev => {
         const newImages = [...prev];
         results.forEach(result => {
@@ -75,25 +119,23 @@ const App: React.FC = () => {
       });
 
     } catch (error) {
-        console.error("A critical error occurred during image processing:", error);
-        // Fallback error for any unhandled exceptions during the process.
-        setEmployeeImages(prev =>
-            prev.map(img => img.status === 'processing' ? { ...img, status: 'error', error: 'Processing failed.' } : img)
-        );
+      console.error("A critical error occurred during image processing:", error);
+      setEmployeeImages(prev =>
+        prev.map(img => img.status === 'processing' ? { ...img, status: 'error', error: 'Processing failed.' } : img)
+      );
     } finally {
-      setIsProcessing(false);
+      setAppState('idle');
     }
-  }, [employeeImages]);
+  }, [employeeImages, masterBackground, companyLogo]);
 
-  // This effect hook triggers the image processing when new photos are uploaded.
   useEffect(() => {
     const hasPendingImages = employeeImages.some(img => img.status === 'pending');
-    if (hasPendingImages && !isProcessing) {
-        processPendingImages();
+    if (hasPendingImages && appState !== 'processing_photos') {
+      processPendingImages();
     }
-  }, [employeeImages, isProcessing, processPendingImages]);
+  }, [employeeImages, appState, processPendingImages]);
 
-
+  const [isZipping, setIsZipping] = useState(false);
   const handleDownloadZip = async () => {
     const processedImages = employeeImages.filter(img => img.status === 'done' && img.processedUrl);
     if (processedImages.length === 0) return;
@@ -101,7 +143,6 @@ const App: React.FC = () => {
     setIsZipping(true);
     try {
       const zip = new JSZip();
-      
       const getPngFilename = (originalFilename: string) => {
         const lastDotIndex = originalFilename.lastIndexOf('.');
         if (lastDotIndex === -1) return `${originalFilename}.png`;
@@ -117,85 +158,124 @@ const App: React.FC = () => {
       const content = await zip.generateAsync({ type: 'blob' });
       saveAs(content, 'harmonized-headshots.zip');
     } catch (error) {
-        console.error("Error creating ZIP file", error);
+      console.error("Error creating ZIP file", error);
     } finally {
-        setIsZipping(false);
+      setIsZipping(false);
     }
   };
 
   const handleReset = () => {
     setEmployeeImages([]);
-  }
-  
+    // Keep background and logo, just reset the employee images
+    if (companyLogo) {
+      setAppState('needs_photos');
+    } else {
+      setAppState('needs_logo');
+    }
+  };
+
   const processedCount = useMemo(() => employeeImages.filter(img => img.status === 'done').length, [employeeImages]);
-  const isIdle = !isProcessing && !isZipping;
-  const canReset = employeeImages.length > 0;
+  const isProcessingPhotos = appState === 'processing_photos';
+
+  const renderStep = (step: number, title: string, isComplete: boolean, isActive: boolean, content: React.ReactNode) => (
+    <div className="p-6 bg-white rounded-xl shadow-md">
+      <div className="flex items-center gap-3 border-b-2 border-slate-200 pb-3 mb-4">
+        {isComplete ? (
+           <CheckCircleIcon className="h-7 w-7 text-green-500" />
+        ) : (
+          <div className={`h-7 w-7 rounded-full flex items-center justify-center font-bold text-white ${isActive ? 'bg-indigo-500' : 'bg-slate-300'}`}>
+            {step}
+          </div>
+        )}
+        <h2 className={`text-xl font-semibold ${isComplete ? 'text-slate-400 line-through' : 'text-slate-700'}`}>{title}</h2>
+      </div>
+      {content}
+    </div>
+  );
+  
+  const logoStepActive = appState === 'needs_logo' || !!companyLogo;
+  const photosStepActive = !!companyLogo && (appState === 'needs_photos' || appState === 'processing_photos' || appState === 'idle');
+
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800">
       <header className="bg-white shadow-sm">
-          <div className="container mx-auto px-4 sm:px-6 lg:px-8 py-4">
-              <h1 className="text-3xl font-bold text-slate-900 tracking-tight">Corporate Headshot Harmonizer</h1>
-              <p className="text-slate-500 mt-1">Create consistent, professional headshots for your entire team.</p>
-          </div>
+        <div className="container mx-auto px-4 sm:px-6 lg:px-8 py-4 flex items-center gap-4">
+          <h1 className="text-2xl font-bold text-slate-800">Company Headshot Harmonizer</h1>
+        </div>
       </header>
 
       <main className="container mx-auto p-4 sm:p-6 lg:p-8">
         <div className="space-y-8">
-          
-          <div className="p-6 bg-white rounded-xl shadow-md">
-            <h2 className="text-xl font-semibold text-slate-700 border-b-2 border-indigo-200 pb-2 mb-4">1. Upload Employee Photos</h2>
-            <ImageUploader 
-              id="employee-uploader"
-              onFilesSelected={handleEmployeesUpload} 
-              multiple 
-              title="Click to upload or drag & drop"
-              subtitle="Processing will start automatically after upload."
-              icon={<UploadIcon />}
-              disabled={isProcessing}
-            />
-          </div>
-
-          <div className="bg-white p-6 rounded-xl shadow-md">
-            <h2 className="text-xl font-semibold text-slate-700 border-b-2 border-indigo-200 pb-2 mb-4">2. Download Results</h2>
-            <div className="flex flex-wrap items-center gap-4">
-                <button 
-                    onClick={handleDownloadZip} 
-                    disabled={processedCount === 0 || !isIdle}
-                    className="flex items-center justify-center gap-2 px-6 py-3 bg-green-600 text-white font-semibold rounded-lg shadow-md hover:bg-green-700 disabled:bg-slate-300 disabled:cursor-not-allowed transition-all duration-300 transform hover:scale-105 disabled:scale-100"
-                >
-                    {isZipping ? <><Spinner className="h-5 w-5" /> Zipping...</> : <><DownloadIcon className="h-5 w-5" /> Download {processedCount > 0 ? `${processedCount} ` : ''}Image{processedCount !== 1 ? 's' : ''} (.zip)</>}
-                </button>
-                 <button 
-                    onClick={handleReset} 
-                    disabled={!canReset || !isIdle}
-                    className="flex items-center justify-center gap-2 px-6 py-3 bg-red-500 text-white font-semibold rounded-lg shadow-md hover:bg-red-600 disabled:bg-slate-300 disabled:cursor-not-allowed transition-all duration-300"
-                >
-                    <TrashIcon className="h-5 w-5" /> Reset
-                </button>
-                {isProcessing && (
-                    <div className="flex items-center gap-2 text-slate-500 font-medium">
-                        <Spinner className="h-5 w-5" />
-                        <span>Harmonizing {employeeImages.filter(i => i.status === 'processing').length} image(s)...</span>
+          {renderStep(1, "Upload Company Logo", !!companyLogo, logoStepActive, (
+            <>
+              <ImageUploader 
+                id="logo-uploader"
+                onFilesSelected={handleLogoUpload} 
+                title={companyLogo ? "Click to replace logo" : "Click to upload logo"}
+                subtitle="The logo will be placed on the t-shirt."
+                icon={<ImageIcon />}
+                disabled={isProcessingPhotos}
+              />
+              {companyLogoUrl && (
+                <div className="mt-6">
+                    <p className="text-sm font-medium text-slate-600 mb-2">Current Logo:</p>
+                    <div className="flex justify-center p-4 bg-slate-100 rounded-lg border border-slate-200">
+                        <img src={companyLogoUrl} alt="Company Logo Preview" className="max-h-24 object-contain" />
                     </div>
-                )}
-            </div>
-          </div>
+                </div>
+              )}
+            </>
+          ))}
+          
+          {renderStep(2, "Review & Download", employeeImages.length > 0, photosStepActive, (
+            <>
+              <ImageUploader 
+                id="employee-uploader"
+                onFilesSelected={handleEmployeesUpload} 
+                multiple 
+                title="Click to upload or drag & drop"
+                subtitle="Processing will start automatically."
+                icon={<UploadIcon />}
+                disabled={!companyLogo || isProcessingPhotos}
+              />
+              {employeeImages.length > 0 && (
+                <div className="mt-8">
+                    <div className="flex flex-wrap items-center gap-4 mb-6">
+                        <button 
+                            onClick={handleDownloadZip} 
+                            disabled={processedCount === 0 || isProcessingPhotos || isZipping}
+                            className="flex items-center justify-center gap-2 px-6 py-3 bg-green-600 text-white font-semibold rounded-lg shadow-md hover:bg-green-700 disabled:bg-slate-300 disabled:cursor-not-allowed transition-all duration-300 transform hover:scale-105 disabled:scale-100"
+                            aria-label={`Download ${processedCount} processed images as a .zip file`}
+                        >
+                            {isZipping ? <><Spinner className="h-5 w-5" /> Zipping...</> : <><DownloadIcon className="h-5 w-5" /> Download {processedCount > 0 ? `${processedCount} ` : ''}Image{processedCount !== 1 ? 's' : ''} (.zip)</>}
+                        </button>
+                        <button 
+                            onClick={handleReset} 
+                            disabled={isProcessingPhotos}
+                            className="flex items-center justify-center gap-2 px-6 py-3 bg-red-500 text-white font-semibold rounded-lg shadow-md hover:bg-red-600 disabled:bg-slate-300 disabled:cursor-not-allowed transition-all duration-300"
+                            aria-label="Remove all images and reset the application"
+                        >
+                            <TrashIcon className="h-5 w-5" /> Reset
+                        </button>
+                        {isProcessingPhotos && (
+                            <div className="flex items-center gap-2 text-slate-500 font-medium">
+                                <Spinner className="h-5 w-5" />
+                                <span>Harmonizing {employeeImages.filter(i => i.status === 'processing').length} image(s)...</span>
+                            </div>
+                        )}
+                    </div>
+    
+                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+                        {employeeImages.map((image) => (
+                            <ImageCard key={image.id} image={image} />
+                        ))}
+                    </div>
+                </div>
+              )}
+            </>
+          ))}
         </div>
-        
-        {employeeImages.length > 0 ? (
-            <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
-                {employeeImages.map((image) => (
-                    <ImageCard key={image.id} image={image} />
-                ))}
-            </div>
-        ) : (
-            <div className="mt-8 text-center py-16 border-2 border-dashed border-slate-300 rounded-xl bg-white">
-                <UploadIcon className="mx-auto h-16 w-16 text-slate-300" />
-                <h3 className="mt-2 text-lg font-medium text-slate-800">Ready for employee photos</h3>
-                <p className="mt-1 text-sm text-slate-500">Upload your team's headshots to get started.</p>
-            </div>
-        )}
       </main>
     </div>
   );

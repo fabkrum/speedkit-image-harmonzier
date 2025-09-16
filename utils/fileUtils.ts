@@ -2,15 +2,18 @@ import { Base64Image } from '../types';
 
 const TARGET_DIMENSION = 965;
 
+interface ConversionOptions {
+  cropToSquare: boolean;
+}
+
 /**
- * Converts any browser-supported image file to a 965x965 pixel PNG base64 string.
- * This is done by drawing the image onto a canvas. If the image is not square,
- * it will be center-cropped to fit the 1:1 aspect ratio.
- * This standardizes the format and dimensions before sending to the Gemini API.
+ * Converts an image file to a base64 string, with an option to crop it into a square.
+ * All output images are converted to PNG format.
  * @param file The image file to convert.
- * @returns A promise that resolves to a Base64Image object with a PNG mime type.
+ * @param options Options for conversion, e.g., whether to crop to a square.
+ * @returns A promise that resolves to a Base64Image object.
  */
-export const convertImageToBase64 = (file: File): Promise<Base64Image> => {
+export const convertImageToBase64 = (file: File, options: ConversionOptions): Promise<Base64Image> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     // Read the file as a Data URL.
@@ -27,34 +30,37 @@ export const convertImageToBase64 = (file: File): Promise<Base64Image> => {
       // When the image is loaded, draw it to the canvas.
       img.onload = () => {
         const canvas = document.createElement('canvas');
-        canvas.width = TARGET_DIMENSION;
-        canvas.height = TARGET_DIMENSION;
         const ctx = canvas.getContext('2d');
 
         if (!ctx) {
           return reject(new Error('Could not get canvas 2D context.'));
         }
 
-        // Calculate dimensions for center-cropping
-        const { width: originalWidth, height: originalHeight } = img;
-        let sx = 0;
-        let sy = 0;
-        let sWidth = originalWidth;
-        let sHeight = originalHeight;
+        if (options.cropToSquare) {
+          // Standardize to 965x965 for headshots
+          canvas.width = TARGET_DIMENSION;
+          canvas.height = TARGET_DIMENSION;
 
-        if (originalWidth > originalHeight) {
-          // Landscape: crop the sides
-          sWidth = originalHeight;
-          sx = (originalWidth - originalHeight) / 2;
-        } else if (originalHeight > originalWidth) {
-          // Portrait: crop the top and bottom
-          sHeight = originalWidth;
-          sy = (originalHeight - originalWidth) / 2;
+          const { width: originalWidth, height: originalHeight } = img;
+          let sx = 0, sy = 0, sWidth = originalWidth, sHeight = originalHeight;
+
+          if (originalWidth > originalHeight) { // Landscape
+            sWidth = originalHeight;
+            sx = (originalWidth - originalHeight) / 2;
+          } else if (originalHeight > originalWidth) { // Portrait
+            sHeight = originalWidth;
+            sy = (originalHeight - originalWidth) / 2;
+          }
+          
+          // Draw the cropped and resized image onto the canvas
+          ctx.drawImage(img, sx, sy, sWidth, sHeight, 0, 0, TARGET_DIMENSION, TARGET_DIMENSION);
+        } else {
+          // Preserve original dimensions for assets like logos
+          canvas.width = img.width;
+          canvas.height = img.height;
+          ctx.drawImage(img, 0, 0);
         }
         
-        // Draw the cropped and resized image onto the canvas
-        ctx.drawImage(img, sx, sy, sWidth, sHeight, 0, 0, TARGET_DIMENSION, TARGET_DIMENSION);
-
         // Get the Data URL of the canvas content as a PNG.
         const dataUrl = canvas.toDataURL('image/png');
         const base64 = dataUrl.split(',')[1];

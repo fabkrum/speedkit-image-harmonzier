@@ -1,4 +1,3 @@
-
 export type ProcessingStatus = 'pending' | 'processing' | 'done' | 'error';
 
 export interface EmployeeImage {
